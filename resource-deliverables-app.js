@@ -1,233 +1,237 @@
 #!/usr/bin/env node
-
-/**
- * Nationwide SCS - Resource Deliverables Slack App
- * 
- * Triggers on:
- * - Slash command: /resource-deliverables (with attached file)
- * - Message containing "resource deliverables" (with attached file)
- * 
- * Processes: Downloads the attachment, renames photos using Claude vision,
- * compresses, and posts the result back to the same channel.
- * 
- * Deploy to Vercel with environment variables:
- * - SLACK_BOT_TOKEN
- * - SLACK_SIGNING_SECRET
- * - ANTHROPIC_API_KEY
- */
-
-import { App, ExpressReceiver } from "@slack/bolt";
-import Anthropic from "@anthropic-ai/sdk";
-import express from "express";
-import fs from "fs";
-import path from "path";
-import https from "https";
-import { execSync } from "child_process";
-import AdmZip from "adm-zip";
-
-// Environment variables
+ 
+import express from 'express';
+import { createHmac } from 'crypto';
+import Anthropic from '@anthropic-ai/sdk';
+import fs from 'fs';
+import path from 'path';
+import https from 'https';
+import { execSync } from 'child_process';
+import AdmZip from 'adm-zip';
+ 
+const app = express();
+const PORT = process.env.PORT || 3000;
+ 
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-
+ 
 if (!SLACK_BOT_TOKEN || !SLACK_SIGNING_SECRET || !ANTHROPIC_API_KEY) {
-  console.error("Missing required environment variables");
+  console.error('Missing environment variables');
   process.exit(1);
 }
-
+ 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-
-// Setup Express receiver for Slack
-const receiver = new ExpressReceiver({
-  signingSecret: SLACK_SIGNING_SECRET,
+ 
+app.use(express.json());
+ 
+// Verify Slack signature
+function verifySlackSignature(req) {
+  const timestamp = req.headers['x-slack-request-timestamp'];
+  const signature = req.headers['x-slack-signature'];
+  
+  if (!timestamp || !signature) return false;
+  
+  const time = Math.floor(Date.now() / 1000);
+  if (Math.abs(time - parseInt(timestamp)) > 300) return false;
+  
+  const sigBasestring = `v0:${timestamp}:${JSON.stringify(req.body)}`;
+  const mySignature = 'v0=' + createHmac('sha256', SLACK_SIGNING_SECRET)
+    .update(sigBasestring)
+    .digest('hex');
+  
+  return mySignature === signature;
+}
+ 
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
 });
-
-const app = new App({
-  token: SLACK_BOT_TOKEN,
-  receiver,
+ 
+// Slack events and commands
+app.post('/slack/events', async (req, res) => {
+  if (!verifySlackSignature(req)) {
+    console.error('Invalid signature');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+ 
+  const { type, challenge } = req.body;
+ 
+  // Slack challenge for URL verification
+  if (type === 'url_verification') {
+    return res.json({ challenge });
+  }
+ 
+  // Handle slash commands
+  if (req.body.command === '/resource-deliverables') {
+    res.json({ response_type: 'in_channel', text: 'Processing resource deliverables...' });
+    return;
+  }
+ 
+  // Handle message events
+  if (type === 'event_callback') {
+    const event = req.body.event;
+    
+    if (event.text && event.text.toLowerCase().includes('resource deliverables') && event.files) {
+      res.json({ ok: true });
+      
+      // Process in background
+      handleResourceDeliverables(event.channel, event.ts, event.files[0])
+        .catch(err => console.error('Error processing:', err));
+      
+      return;
+    }
+  }
+ 
+  res.json({ ok: true });
 });
-
-// Subject vocabulary (from rename-site-photos skill)
-const SUBJECTS = {
-  Rack: "Open or enclosed rack",
-  Cabinet: "Enclosed cabinet",
-  "Patch-Panel": "Copper or fiber patch panel",
-  Switch: "Single switch",
-  "Switch-Stack": "Stacked or multiple switches",
-  AP: "Wireless access point",
-  "Data-Jack": "Jack, outlet, faceplate",
-  Faceplate: "Faceplate",
-  "Fiber-Enclosure": "Fiber housing, cassette",
-  Fiber: "Fiber cable, trunk, run",
-  "Cable-Tray": "Tray, ladder rack, basket",
-  "J-Hook": "J-hooks and supports",
-  Conduit: "Conduit, sleeve, core",
-  Pathway: "Pathway (mixed)",
-  "Ground-Bar": "Bonding, grounding",
-  UPS: "UPS unit",
-  PDU: "Power strip, PDU",
-  "Cable-Mgmt": "Cable managers",
-  Label: "Close shot of label",
-  Demarc: "Demarc, MPOE",
-  "Telecom-Room": "Room shot",
-  Riser: "Riser, backbone",
-  Camera: "Cameras and endpoints",
-  Ceiling: "Above-ceiling",
-  "Wall-Field": "Backboard, wall-mounted",
-  "Existing-Conditions": "Pre-work, damage",
-  "Test-Results": "Tester screen, cert",
-  Exterior: "Building exterior",
-  "Floor-Plan": "Plan, marked-up drawing",
-  Overview: "Wide establishing shot",
-  Misc: "Unclassified",
-};
-
-// Download file from URL
-async function downloadFile(url, filepath, token) {
+ 
+async function handleResourceDeliverables(channelId, threadTs, file) {
+  try {
+    const tempDir = path.join('/tmp', `resource-${Date.now()}`);
+    const extractDir = path.join(tempDir, 'extracted');
+    fs.mkdirSync(extractDir, { recursive: true });
+ 
+    // Download file
+    const downloadPath = path.join(tempDir, file.name);
+    await downloadFile(file.url_private, downloadPath, SLACK_BOT_TOKEN);
+ 
+    // Extract ZIP
+    if (file.name.endsWith('.zip')) {
+      const zip = new AdmZip(downloadPath);
+      zip.extractAllTo(extractDir, true);
+    } else {
+      fs.copyFileSync(downloadPath, path.join(extractDir, file.name));
+    }
+ 
+    // Process photos
+    const result = await processPhotos(extractDir);
+ 
+    if (result.success) {
+      // Upload result to Slack
+      await uploadToSlack(channelId, threadTs, result.zipPath);
+    }
+ 
+    // Cleanup
+    fs.rmSync(tempDir, { recursive: true });
+  } catch (error) {
+    console.error('Resource deliverables error:', error);
+  }
+}
+ 
+function downloadFile(url, filepath, token) {
   return new Promise((resolve, reject) => {
     const options = {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
+      headers: { Authorization: `Bearer ${token}` },
     };
     const file = fs.createWriteStream(filepath);
     https
       .get(url, options, (response) => {
         response.pipe(file);
-        file.on("finish", () => {
+        file.on('finish', () => {
           file.close();
           resolve();
         });
       })
-      .on("error", (err) => {
+      .on('error', (err) => {
         fs.unlink(filepath, () => {});
         reject(err);
       });
   });
 }
-
-// Convert image to base64
+ 
 function imageToBase64(filepath) {
-  return fs.readFileSync(filepath).toString("base64");
+  return fs.readFileSync(filepath).toString('base64');
 }
-
-// Get media type from extension
+ 
 function getMediaType(filepath) {
   const ext = path.extname(filepath).toLowerCase();
   const types = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
   };
-  return types[ext] || "image/jpeg";
+  return types[ext] || 'image/jpeg';
 }
-
-// Analyze photo with Claude vision
+ 
 async function analyzePhoto(filepath) {
   try {
     const base64 = imageToBase64(filepath);
     const mediaType = getMediaType(filepath);
-
+ 
     const response = await anthropic.messages.create({
-      model: "claude-opus-4-1-20250805",
+      model: 'claude-opus-4-1-20250805',
       max_tokens: 300,
       messages: [
         {
-          role: "user",
+          role: 'user',
           content: [
             {
-              type: "image",
-              source: {
-                type: "base64",
-                media_type: mediaType,
-                data: base64,
-              },
+              type: 'image',
+              source: { type: 'base64', media_type: mediaType, data: base64 },
             },
             {
-              type: "text",
-              text: `Analyze this infrastructure photo. Respond ONLY with JSON (no markdown):
-{
-  "subject": "one of: Rack, Cabinet, Patch-Panel, Switch, Switch-Stack, AP, Data-Jack, Faceplate, Fiber-Enclosure, Fiber, Cable-Tray, J-Hook, Conduit, Pathway, Ground-Bar, UPS, PDU, Cable-Mgmt, Label, Demarc, Telecom-Room, Riser, Camera, Ceiling, Wall-Field, Existing-Conditions, Test-Results, Exterior, Floor-Plan, Overview, Misc",
-  "detail": "null or: visible label, room number, space name",
-  "variant": "null or: WIDE, CLOSE, REAR, FRONT, LABEL, BEFORE, AFTER",
-  "confidence": "high, medium, or low"
-}`,
+              type: 'text',
+              text: `Identify this infrastructure photo. Respond ONLY with JSON: {"subject":"Rack|Cabinet|Patch-Panel|Switch|Switch-Stack|AP|Data-Jack|Faceplate|Fiber|Cable-Tray|Conduit|Demarc|Overview|Misc","detail":"null or: MDF, IDF1, Corridor, etc","variant":"null or: WIDE, CLOSE, REAR"}`,
             },
           ],
         },
       ],
     });
-
-    const content = response.content[0].type === "text" ? response.content[0].text : "";
+ 
     try {
-      return JSON.parse(content);
+      return JSON.parse(response.content[0].text);
     } catch (e) {
-      return { subject: "Misc", detail: null, variant: null, confidence: "low" };
+      return { subject: 'Misc', detail: null, variant: null };
     }
   } catch (error) {
-    console.error(`Vision analysis error: ${error.message}`);
-    return { subject: "Misc", detail: null, variant: null, confidence: "low" };
+    console.error('Vision error:', error);
+    return { subject: 'Misc', detail: null, variant: null };
   }
 }
-
-// Build filename from components
+ 
 function buildFilename(subject, detail, variant, number, ext) {
   let name = subject;
   if (detail) name += `-${detail}`;
   if (variant) name += `-${variant}`;
-  name += `-${String(number).padStart(2, "0")}`;
+  name += `-${String(number).padStart(2, '0')}`;
   return name + ext;
 }
-
-// Process photos in a directory
+ 
 async function processPhotos(sourceDir) {
-  const imageExtensions = [".jpg", ".jpeg", ".png"];
+  const imageExtensions = ['.jpg', '.jpeg', '.png'];
   const files = fs
     .readdirSync(sourceDir)
     .filter((f) => imageExtensions.includes(path.extname(f).toLowerCase()));
-
+ 
   if (files.length === 0) {
-    return { success: false, message: "No image files found in attachment" };
+    return { success: false, message: 'No images found' };
   }
-
-  // Analyze each photo
+ 
+  // Analyze photos
   const analyses = {};
-  const errors = [];
-
   for (const file of files) {
-    try {
-      const filepath = path.join(sourceDir, file);
-      const analysis = await analyzePhoto(filepath);
-      analyses[file] = analysis;
-    } catch (error) {
-      errors.push(`${file}: ${error.message}`);
-    }
+    const filepath = path.join(sourceDir, file);
+    analyses[file] = await analyzePhoto(filepath);
   }
-
-  if (Object.keys(analyses).length === 0) {
-    return { success: false, message: "Failed to analyze images" };
-  }
-
-  // Build rename mapping with deduplication
+ 
+  // Build rename mapping
   const nameGroups = {};
   const renames = {};
-
+ 
   for (const file of files) {
-    if (!analyses[file]) continue;
-
     const analysis = analyses[file];
     const ext = path.extname(file);
-    const key = `${analysis.subject}|${analysis.detail || ""}|${analysis.variant || ""}`;
-
+    const key = `${analysis.subject}|${analysis.detail || ''}|${analysis.variant || ''}`;
+ 
     if (!nameGroups[key]) nameGroups[key] = [];
     nameGroups[key].push(file);
   }
-
-  // Assign numbers to each group
+ 
   for (const [key, fileGroup] of Object.entries(nameGroups)) {
-    const [subject, detail, variant] = key.split("|");
+    const [subject, detail, variant] = key.split('|');
     for (let i = 0; i < fileGroup.length; i++) {
       const file = fileGroup[i];
       const newName = buildFilename(
@@ -240,162 +244,43 @@ async function processPhotos(sourceDir) {
       renames[file] = newName;
     }
   }
-
-  // Perform renames
+ 
+  // Rename files
   for (const [old, newName] of Object.entries(renames)) {
     const oldPath = path.join(sourceDir, old);
     const newPath = path.join(sourceDir, newName);
     fs.renameSync(oldPath, newPath);
   }
-
+ 
   // Compress
-  const timestamp = Date.now();
-  const zipPath = path.join(sourceDir, `..`, `resource-deliverables-${timestamp}.zip`);
+  const zipName = `resource-deliverables-${Date.now()}.zip`;
+  const zipPath = path.join(sourceDir, '..', zipName);
   execSync(`cd ${sourceDir} && zip -q -r ${path.basename(zipPath)} .`);
-
+ 
   return {
     success: true,
     zipPath,
     filesProcessed: Object.keys(renames).length,
-    renames,
-    errors,
   };
 }
-
-// Handle slash command
-app.command("/resource-deliverables", async ({ ack, body, client }) => {
-  await ack();
-
-  const { trigger_id, channel_id, user_id } = body;
-
-  // Open modal to accept file upload OR redirect to message instruction
-  await client.views.open({
-    trigger_id,
-    view: {
-      type: "modal",
-      callback_id: "resource_deliverables_modal",
-      title: {
-        type: "plain_text",
-        text: "Resource Deliverables",
-      },
-      blocks: [
-        {
-          type: "section",
-          text: {
-            type: "mrkdwn",
-            text: "Post a message with your file in this channel and say *resource deliverables*. The automation will process it immediately.",
-          },
-        },
-      ],
-      close: {
-        type: "plain_text",
-        text: "Close",
-      },
-    },
+ 
+async function uploadToSlack(channelId, threadTs, zipPath) {
+  const form = new FormData();
+  form.append('token', SLACK_BOT_TOKEN);
+  form.append('channels', channelId);
+  form.append('thread_ts', threadTs);
+  form.append('title', 'Resource Deliverables - Renamed');
+  form.append('file', fs.createReadStream(zipPath));
+ 
+  const response = await fetch('https://slack.com/api/files.upload', {
+    method: 'POST',
+    body: form,
   });
-});
-
-// Handle message events
-app.message("resource deliverables", async ({ message, say, client }) => {
-  // Only process messages with files
-  if (!message.files || message.files.length === 0) {
-    await say("Please attach a file with photos to process.");
-    return;
-  }
-
-  const file = message.files[0];
-  const channelId = message.channel;
-  const threadTs = message.ts;
-
-  // Acknowledge with reaction
-  await client.reactions.add({
-    channel: channelId,
-    timestamp: threadTs,
-    emoji: "hourglass_flowing_sand",
-  });
-
-  try {
-    // Create temp directory for processing
-    const tempDir = path.join("/tmp", `resource-${Date.now()}`);
-    const extractDir = path.join(tempDir, "extracted");
-    fs.mkdirSync(extractDir, { recursive: true });
-
-    // Download file
-    const downloadPath = path.join(tempDir, file.name);
-    await downloadFile(file.url_private, downloadPath, SLACK_BOT_TOKEN);
-
-    // Extract if ZIP
-    if (file.name.endsWith(".zip")) {
-      const zip = new AdmZip(downloadPath);
-      zip.extractAllTo(extractDir, true);
-    } else {
-      // Single file or copy directly
-      fs.copyFileSync(downloadPath, path.join(extractDir, file.name));
-    }
-
-    // Process photos
-    const result = await processPhotos(extractDir);
-
-    // Remove hourglass reaction
-    await client.reactions.remove({
-      channel: channelId,
-      timestamp: threadTs,
-      emoji: "hourglass_flowing_sand",
-    });
-
-    if (!result.success) {
-      await say({
-        thread_ts: threadTs,
-        text: `Failed to process files: ${result.message}`,
-      });
-      return;
-    }
-
-    // Upload result
-    const uploadResult = await client.files.upload({
-      channels: channelId,
-      file: fs.createReadStream(result.zipPath),
-      filename: path.basename(result.zipPath),
-      thread_ts: threadTs,
-      title: "Resource Deliverables - Renamed",
-    });
-
-    // Post summary
-    await say({
-      thread_ts: threadTs,
-      text: `Processed ${result.filesProcessed} photos. Renamed and compressed.`,
-    });
-
-    // Add checkmark reaction
-    await client.reactions.add({
-      channel: channelId,
-      timestamp: threadTs,
-      emoji: "white_check_mark",
-    });
-
-    // Cleanup
-    fs.rmSync(tempDir, { recursive: true });
-  } catch (error) {
-    console.error("Error processing file:", error);
-    await client.reactions.add({
-      channel: channelId,
-      timestamp: threadTs,
-      emoji: "x",
-    });
-    await say({
-      thread_ts: threadTs,
-      text: `Error processing file: ${error.message}`,
-    });
-  }
-});
-
-// Health check endpoint
-receiver.app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
-});
-
-// Start server
-const PORT = process.env.PORT || 3000;
-receiver.app.listen(PORT, () => {
+ 
+  const data = await response.json();
+  console.log('Upload result:', data);
+}
+ 
+app.listen(PORT, () => {
   console.log(`Slack app listening on port ${PORT}`);
 });
