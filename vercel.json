@@ -11,10 +11,5 @@
       "src": "/(.*)",
       "dest": "resource-deliverables-app.js"
     }
-  ],
-  "env": {
-    "SLACK_BOT_TOKEN": "@slack_bot_token",
-    "SLACK_SIGNING_SECRET": "@slack_signing_secret",
-    "ANTHROPIC_API_KEY": "@anthropic_api_key"
-  }
+  ]
 }
