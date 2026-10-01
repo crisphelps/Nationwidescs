@@ -1,0 +1,23 @@
+{
+  "name": "resource-deliverables-slack-app",
+  "version": "1.0.0",
+  "description": "Nationwide SCS - Auto-rename and compress resource deliverables in Slack",
+  "type": "module",
+  "main": "resource-deliverables-app.js",
+  "scripts": {
+    "start": "node resource-deliverables-app.js",
+    "dev": "nodemon resource-deliverables-app.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.27.0",
+    "@slack/bolt": "^3.21.0",
+    "adm-zip": "^0.5.10",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
